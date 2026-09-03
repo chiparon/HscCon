@@ -1,0 +1,136 @@
+{
+  "baseline_path": "E:\\Eproject\\HiFCon\\workbench\\solution_reference.py",
+  "baseline_quality": {
+    "attention_mse": {
+      "attention_gqa_4to1": 0.1739958922068278,
+      "attention_gqa_8to1_outlier": 0.5507665475209554,
+      "attention_mha": 0.07231444989641507
+    },
+    "linear_mse": {
+      "linear_normal_256": 40.446390787760414,
+      "linear_outlier_512": 425.94573974609375,
+      "linear_tall_2048": 128.82932790120444,
+      "linear_wide_1024": 339.2412821451823
+    },
+    "mean_attention_mse": 0.2656922965413994,
+    "mean_linear_mse": 233.61568514506024
+  },
+  "baseline_timing": {
+    "by_function": {
+      "hif4_calibration_and_quantize_weight": {
+        "calls": 20,
+        "median_ms": 10.340250000000001,
+        "p95_ms": 13.948369999999999,
+        "total_ms": 199.235
+      },
+      "hif4_calibration_attention": {
+        "calls": 15,
+        "median_ms": 0.0024,
+        "p95_ms": 0.0032300000000000002,
+        "total_ms": 0.0375
+      },
+      "hif4_dynamic_quantize_activation": {
+        "calls": 60,
+        "median_ms": 4.57105,
+        "p95_ms": 6.20709,
+        "total_ms": 281.7035
+      },
+      "hif4_dynamic_quantize_k": {
+        "calls": 45,
+        "median_ms": 4.3746,
+        "p95_ms": 5.29958,
+        "total_ms": 192.5376
+      },
+      "hif4_dynamic_quantize_q": {
+        "calls": 45,
+        "median_ms": 4.8901,
+        "p95_ms": 5.88594,
+        "total_ms": 217.50680000000008
+      },
+      "hif4_dynamic_quantize_v": {
+        "calls": 45,
+        "median_ms": 4.4505,
+        "p95_ms": 5.653759999999998,
+        "total_ms": 195.69209999999998
+      }
+    },
+    "median_suite_ms": 214.98820000000003,
+    "overall": {
+      "calls": 230,
+      "median_ms": 4.57475,
+      "p95_ms": 7.630659999999994,
+      "total_ms": 1086.7124999999994
+    },
+    "p95_suite_ms": 224.04932000000002
+  },
+  "candidate_path": "E:\\Eproject\\HiFCon\\workbench\\solution_exact_fast_candidate.py",
+  "candidate_quality": {
+    "attention_mse": {
+      "attention_gqa_4to1": 0.1739958922068278,
+      "attention_gqa_8to1_outlier": 0.5507665475209554,
+      "attention_mha": 0.07231444989641507
+    },
+    "linear_mse": {
+      "linear_normal_256": 40.446390787760414,
+      "linear_outlier_512": 425.94573974609375,
+      "linear_tall_2048": 128.82932790120444,
+      "linear_wide_1024": 339.2412821451823
+    },
+    "mean_attention_mse": 0.2656922965413994,
+    "mean_linear_mse": 233.61568514506024
+  },
+  "candidate_timing": {
+    "by_function": {
+      "hif4_calibration_and_quantize_weight": {
+        "calls": 20,
+        "median_ms": 2.6281,
+        "p95_ms": 4.6474850000000005,
+        "total_ms": 51.302
+      },
+      "hif4_calibration_attention": {
+        "calls": 15,
+        "median_ms": 0.0132,
+        "p95_ms": 0.01688,
+        "total_ms": 0.19640000000000002
+      },
+      "hif4_dynamic_quantize_activation": {
+        "calls": 60,
+        "median_ms": 1.11645,
+        "p95_ms": 1.7069249999999998,
+        "total_ms": 69.7767
+      },
+      "hif4_dynamic_quantize_k": {
+        "calls": 45,
+        "median_ms": 0.9563,
+        "p95_ms": 1.23538,
+        "total_ms": 44.13120000000001
+      },
+      "hif4_dynamic_quantize_q": {
+        "calls": 45,
+        "median_ms": 1.1875,
+        "p95_ms": 1.47468,
+        "total_ms": 53.01859999999999
+      },
+      "hif4_dynamic_quantize_v": {
+        "calls": 45,
+        "median_ms": 0.9932,
+        "p95_ms": 1.2330399999999997,
+        "total_ms": 44.1482
+      }
+    },
+    "median_suite_ms": 52.19560000000001,
+    "overall": {
+      "calls": 230,
+      "median_ms": 1.07225,
+      "p95_ms": 2.319304999999997,
+      "total_ms": 262.5731000000001
+    },
+    "p95_suite_ms": 55.41847999999999
+  },
+  "data_generation_ms": 222.9085,
+  "profile": "stress",
+  "relative_speedup": 4.138704612163237,
+  "repeats": 5,
+  "seed": 20260903,
+  "warmup": 2
+}

@@ -1,10 +1,10 @@
-"""Fast, exact dynamic-programming NVFP4 to HiF4 conversion.
+"""Exact dynamic-programming HiF4 candidate with a fixed, vectorized fast path.
 
-The HiF4 hierarchy admits eight level-2/level-3 layouts per eight-value
-group, but only three distinct effective scales per four-value subgroup.  This
-implementation evaluates those three reconstruction errors once and solves the
-same optimum with a two-path dynamic program.  It therefore preserves the
-exhaustive reference result without its eight full quantization passes.
+The slow reference enumerates all eight legal (level-2, level-3a, level-3b)
+layouts for every eight-value group.  This implementation evaluates the three
+possible *total* micro-exponents once per four-value group, then solves the same
+choice by a two-path dynamic program.  There are no loops over data blocks and
+no candidate dimension containing copies of the full input tensor.
 """
 
 from __future__ import annotations
@@ -18,12 +18,11 @@ NVFP4_BLOCK_SIZE = 16
 HIF4_BLOCK_SIZE = 64
 _E6M2_MIN = 2.0**-48
 _E6M2_MAX = 49152.0
+# BF16 representation of 1/7 used by the exhaustive reference.
 _BF16_ONE_OVER_SEVEN = 0.142578125
 
 
 class HiF4Params(TypedDict):
-    """Five tensors forming a legal HiF4 hierarchy."""
-
     scale_factor: torch.Tensor
     scale_lv2: torch.Tensor
     scale_lv3: torch.Tensor
@@ -52,8 +51,8 @@ def dequantize_nvfp4(
             f"scale shape {tuple(scale_float.shape)} does not match expected "
             f"shape {tuple(expected)}"
         )
-    blocked = quant_float.reshape(*quant_float.shape[:-1], -1, blk_size)
-    return (blocked * scale_float.unsqueeze(-1)).flatten(-2).to(torch.bfloat16)
+    x = quant_float.reshape(*quant_float.shape[:-1], -1, blk_size)
+    return (x * scale_float.unsqueeze(-1)).flatten(-2).to(torch.bfloat16)
 
 
 def _restore_as_hif4_blocks(
@@ -75,11 +74,11 @@ def _restore_as_hif4_blocks(
         )
 
     prefix = quant_float.shape[:-1]
-    blocks = channels // HIF4_BLOCK_SIZE
-    q16 = quant_float.reshape(*prefix, blocks, 4, NVFP4_BLOCK_SIZE)
-    s16 = scale_float.reshape(*prefix, blocks, 4, 1)
+    n64 = channels // HIF4_BLOCK_SIZE
+    q16 = quant_float.reshape(*prefix, n64, 4, NVFP4_BLOCK_SIZE)
+    s16 = scale_float.reshape(*prefix, n64, 4, 1)
     restored = (q16 * s16).to(torch.bfloat16).to(torch.float32)
-    return restored.reshape(*prefix, blocks, 8, 2, 4)
+    return restored.reshape(*prefix, n64, 8, 2, 4)
 
 
 def _nearest_e6m2(x: torch.Tensor) -> torch.Tensor:
@@ -94,7 +93,7 @@ def _nearest_e6m2(x: torch.Tensor) -> torch.Tensor:
 def _loss_at_exponent(
     absolute: torch.Tensor, base_scale: torch.Tensor, exponent_scale: float
 ) -> torch.Tensor:
-    """Return the reconstruction SSE for each four-value subgroup."""
+    """Per-four-value reconstruction SSE for one total exponent."""
     denominator = base_scale[..., None, None, None] * exponent_scale
     code = torch.round(absolute * (4.0 / denominator)).clamp_(0.0, 7.0)
     code.mul_(denominator * 0.25).sub_(absolute).square_()
@@ -104,23 +103,25 @@ def _loss_at_exponent(
 def _quantize_hif4(
     quant_float: torch.Tensor, scale_float: torch.Tensor
 ) -> HiF4Params:
-    """Select the exact minimum-SSE hierarchy with a vectorized DP."""
-    restored = _restore_as_hif4_blocks(quant_float, scale_float)
-    absolute = restored.abs()
+    """Select the exact minimum-SSE hierarchy with an algebraically reduced DP."""
+    x = _restore_as_hif4_blocks(quant_float, scale_float)
+    absolute = x.abs()
     peak64 = absolute.amax(dim=(-1, -2, -3))
     raw_scale = (peak64.to(torch.bfloat16) * _BF16_ONE_OVER_SEVEN).to(
         torch.float32
     )
     scale_factor = _nearest_e6m2(raw_scale)
 
-    # lv2 * lv3 can only be 1, 2 or 4.  Compute each local error once.
+    # Only three total exponent values exist: lv2_bit + lv3_bit in {0,1,2}.
+    # Each call holds one payload-sized temporary, rather than materializing a
+    # 3x or 8x candidate tensor.
     loss0 = _loss_at_exponent(absolute, scale_factor, 1.0)
     loss1 = _loss_at_exponent(absolute, scale_factor, 2.0)
     loss2 = _loss_at_exponent(absolute, scale_factor, 4.0)
 
-    # Each lv2 path independently picks the better lv3 for its two children.
-    # Strict comparisons preserve the exhaustive reference's lower-scale tie
-    # order: lv2=1 before 2 and lv3=1 before 2.
+    # For lv2=1, each of the two lv3 branches independently chooses e=0/1.
+    # For lv2=2 it chooses e=1/2.  Strict comparisons ensure every exact tie
+    # selects the smaller exponent, matching the reference enumeration order.
     path_l2_1 = torch.minimum(loss0, loss1).sum(dim=-1)
     path_l2_2 = torch.minimum(loss1, loss2).sum(dim=-1)
     lv2_bit = path_l2_2 < path_l2_1
@@ -135,7 +136,7 @@ def _quantize_hif4(
     denominator = scale_factor[..., None, None, None] * total_scale.unsqueeze(-1)
     mant = torch.round(absolute * (4.0 / denominator)).clamp_(0.0, 7.0)
     mant.mul_(0.25)
-    sign = torch.where(mant == 0, torch.zeros_like(restored), torch.sign(restored))
+    sign = torch.where(mant == 0, torch.zeros_like(x), torch.sign(x))
 
     return {
         "scale_factor": scale_factor.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1),
@@ -152,7 +153,6 @@ def hif4_calibration_and_quantize_weight(
     weight_scale: torch.Tensor,
     calib_activation_list: list,
 ) -> dict[str, Any]:
-    """Quantize a static Linear weight and return portable online state."""
     del calib_activation_list
     return {
         "weight_params": _quantize_hif4(weight_quant, weight_scale),
@@ -177,13 +177,8 @@ def hif4_calibration_attention(
     kv_num_heads: int,
     head_dim: int,
 ) -> dict[str, Any]:
-    """Return scalar-only portable state for all three attention operands."""
     del calib_qkv_list, q_num_heads, kv_num_heads, head_dim
-    return {
-        "q_state": {"version": 2},
-        "k_state": {"version": 2},
-        "v_state": {"version": 2},
-    }
+    return {"q_state": {"version": 2}, "k_state": {"version": 2}, "v_state": {"version": 2}}
 
 
 @torch.inference_mode()

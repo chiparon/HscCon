@@ -70,4 +70,4 @@ python tools/package_solution.py
 
 ## 当前状态
 
-已建立比赛要求的六函数接口、NVFP4 反量化辅助函数和基础契约测试。量化函数当前显式抛出 `NotImplementedError`，将在后续比赛资料明确算法与评分约束后逐步实现；在格式契约冻结前，不对数值行为作隐式假设。
+已完成六函数 v1：使用固定 E6M2 base 和向量化层级动态规划，将每个 8-value 节点的八种合法布局约化为三个有效倍率的误差计算。自建 Linear/MHA/GQA/outlier 数据集会同时校验 HiF4 值域、算子 MSE 与六接口耗时；根目录 `solution.py` 可直接打包提交。
