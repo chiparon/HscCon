@@ -43,6 +43,15 @@ _IMPORTANCE_POWER = 0.5
 _WEIGHT_BASE_OFFSETS = (0,)
 _ACTIVATION_BASE_OFFSETS = (0,)
 _USE_MULTIBASE_V = True
+_USE_SPARSE_HESSIAN_WEIGHT_REFINEMENT = True
+_SPARSE_HESSIAN_TOP_FRACTION = 0.06
+_SPARSE_HESSIAN_CALIBRATION_ROWS = 32
+_SPARSE_HESSIAN_MIN_CALIBRATION_SAMPLES = 5
+_SPARSE_HESSIAN_MIN_WEIGHT_ROWS = 4096
+_SPARSE_HESSIAN_MIN_CHANNELS = 1024
+_SPARSE_HESSIAN_DAMPING = 0.01
+_SPARSE_HESSIAN_MIN_IMPROVEMENT = 0.005
+_SPARSE_HESSIAN_CHUNK_BLOCKS = 8192
 _ATTENTION_MIN_GQA_RATIO = 4
 _ATTENTION_MIN_CALIBRATION_SAMPLES = 2
 _ATTENTION_MAX_LOG_SMOOTH_STD = 0.22
@@ -293,6 +302,253 @@ def _dequantize_hif4_params(params: Mapping[str, torch.Tensor]) -> torch.Tensor:
     ).flatten(-4)
 
 
+def _hessian_local_scale_options(
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    lv2 = torch.tensor(
+        [1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0],
+        dtype=torch.float32,
+        device=device,
+    )
+    lv3 = torch.tensor(
+        [
+            [1.0, 1.0],
+            [1.0, 2.0],
+            [2.0, 1.0],
+            [2.0, 2.0],
+            [1.0, 1.0],
+            [1.0, 2.0],
+            [2.0, 1.0],
+            [2.0, 2.0],
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    return lv2, lv3
+
+
+def _build_sparse_block_hessians(
+    transformed_samples: list[torch.Tensor],
+    channels: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    rows = [
+        sample.reshape(-1, channels).to(torch.float32)
+        for sample in transformed_samples
+        if isinstance(sample, torch.Tensor) and sample.numel()
+    ]
+    if not rows:
+        return None
+    matrix = torch.cat(rows, dim=0)
+    if matrix.shape[0] < 2 or channels % HIF4_BLOCK_SIZE:
+        return None
+    block_count = channels // HIF4_BLOCK_SIZE
+
+    def build(part: torch.Tensor) -> torch.Tensor:
+        blocked = part.reshape(-1, block_count, HIF4_BLOCK_SIZE)
+        hessian = torch.einsum("nbi,nbj->bij", blocked, blocked)
+        hessian.div_(float(max(int(blocked.shape[0]), 1)))
+        trace = torch.diagonal(hessian, dim1=-2, dim2=-1).sum(-1)
+        scale = (trace / float(HIF4_BLOCK_SIZE)).clamp_min_(1.0e-8)
+        eye = torch.eye(HIF4_BLOCK_SIZE, dtype=torch.float32, device=part.device)
+        return hessian / scale[:, None, None] + _SPARSE_HESSIAN_DAMPING * eye
+
+    midpoint = max(int(matrix.shape[0]) // 2, 1)
+    left = matrix[:midpoint]
+    right = matrix[midpoint:] if midpoint < int(matrix.shape[0]) else matrix
+    return build(matrix), build(left), build(right)
+
+
+def _hessian_loss_and_product(
+    error: torch.Tensor, hessian: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    product = torch.bmm(error[:, None, :], hessian).squeeze(1)
+    return (product * error).sum(dim=-1), product
+
+
+def _initial_hessian_choices(
+    flat_params: Mapping[str, torch.Tensor],
+) -> torch.Tensor:
+    lv2 = flat_params["scale_lv2"].squeeze(-1).squeeze(-1)
+    lv3 = flat_params["scale_lv3"].squeeze(-1)
+    return (
+        (lv2 > 1.5).to(torch.long) * 4
+        + (lv3[:, :, 0] > 1.5).to(torch.long) * 2
+        + (lv3[:, :, 1] > 1.5).to(torch.long)
+    )
+
+
+def _materialize_fixed_base_blocks(
+    values: torch.Tensor,
+    base_scale: torch.Tensor,
+    choices: torch.Tensor,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    device = values.device
+    lv2_options, lv3_options = _hessian_local_scale_options(device)
+    blocked = values.reshape(-1, 8, 2, 4)
+    lv2 = lv2_options[choices]
+    lv3 = lv3_options[choices]
+    total_scale = (
+        base_scale[:, None, None, None]
+        * lv2[:, :, None, None]
+        * lv3[:, :, :, None]
+    )
+    mant = torch.round(blocked.abs() * (4.0 / total_scale)).clamp_(0.0, 7.0)
+    mant.mul_(0.25)
+    sign = torch.where(mant == 0, torch.zeros_like(blocked), torch.sign(blocked))
+    reconstructed = (sign * mant * total_scale).reshape(-1, HIF4_BLOCK_SIZE)
+    return {
+        "scale_factor": base_scale[:, None, None, None],
+        "scale_lv2": lv2[:, :, None, None],
+        "scale_lv3": lv3[:, :, :, None],
+        "sign": sign,
+        "mant": mant,
+    }, reconstructed
+
+
+def _sweep_sparse_hessian_blocks(
+    values: torch.Tensor,
+    base_scale: torch.Tensor,
+    choices: torch.Tensor,
+    hessian: torch.Tensor,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    batch = int(values.shape[0])
+    params, reconstructed = _materialize_fixed_base_blocks(
+        values, base_scale, choices
+    )
+    del params
+    error = values - reconstructed
+    _, hessian_error = _hessian_loss_and_product(error, hessian)
+    lv2_options, lv3_options = _hessian_local_scale_options(values.device)
+    grouped_values = values.reshape(batch, 8, 2, 4)
+    grouped_reconstructed = reconstructed.reshape(batch, 8, 8)
+    grouped_error = error.reshape(batch, 8, 8)
+    row_index = torch.arange(batch, device=values.device)
+
+    for group in range(8):
+        group_values = grouped_values[:, group]
+        group_scale = (
+            base_scale[:, None, None, None]
+            * lv2_options[None, :, None, None]
+            * lv3_options[None, :, :, None]
+        )
+        group_mant = torch.round(
+            group_values.abs()[:, None, :, :] * (4.0 / group_scale)
+        ).clamp_(0.0, 7.0)
+        group_mant.mul_(0.25)
+        group_sign = torch.where(
+            group_mant == 0,
+            torch.zeros_like(group_mant),
+            torch.sign(group_values)[:, None, :, :],
+        )
+        candidates = (group_sign * group_mant * group_scale).reshape(batch, 8, 8)
+        delta = candidates - grouped_reconstructed[:, group, None, :]
+        start = group * 8
+        stop = start + 8
+        local_hessian = hessian[:, start:stop, start:stop]
+        local_product = hessian_error[:, start:stop]
+        delta_loss = -2.0 * (delta * local_product[:, None, :]).sum(dim=-1)
+        delta_loss += torch.einsum("boi,bij,boj->bo", delta, local_hessian, delta)
+        best_option = delta_loss.argmin(dim=1)
+        best_delta = delta[row_index, best_option]
+        grouped_reconstructed[:, group, :].add_(best_delta)
+        grouped_error[:, group, :].sub_(best_delta)
+        choices[:, group] = best_option
+        hessian_columns = hessian[:, :, start:stop]
+        hessian_error.sub_(
+            torch.bmm(hessian_columns, best_delta[:, :, None]).squeeze(-1)
+        )
+
+    return _materialize_fixed_base_blocks(values, base_scale, choices)
+
+
+def _apply_sparse_hessian_weight_refinement(
+    values: torch.Tensor,
+    weight_params: HiF4Params,
+    transformed_samples: list[torch.Tensor],
+) -> HiF4Params:
+    if len(transformed_samples) < _SPARSE_HESSIAN_MIN_CALIBRATION_SAMPLES:
+        return weight_params
+    rows, channels = int(values.shape[0]), int(values.shape[-1])
+    block_count = channels // HIF4_BLOCK_SIZE
+    hessians = _build_sparse_block_hessians(transformed_samples, channels)
+    if hessians is None or block_count == 0:
+        return weight_params
+    full_hessian, left_hessian, right_hessian = hessians
+    total_blocks = rows * block_count
+    refined_count = int(total_blocks * _SPARSE_HESSIAN_TOP_FRACTION)
+    if refined_count <= 0:
+        return weight_params
+
+    reconstructed = _dequantize_hif4_params(weight_params).reshape(rows, channels)
+    values_blocks = values.reshape(rows, block_count, HIF4_BLOCK_SIZE)
+    error_blocks = (values - reconstructed).reshape(
+        rows, block_count, HIF4_BLOCK_SIZE
+    )
+    hessian_error = torch.einsum("rbi,bij->rbj", error_blocks, full_hessian)
+    base_loss = (hessian_error * error_blocks).sum(dim=-1)
+    diagonal = torch.diagonal(full_hessian, dim1=-2, dim2=-1)
+    offdiag_product = hessian_error - error_blocks * diagonal.unsqueeze(0)
+    pressure = offdiag_product.square().sum(dim=-1) / base_loss.abs().clamp_min(
+        1.0e-12
+    )
+    pressure = torch.nan_to_num(pressure, nan=0.0, posinf=0.0, neginf=0.0)
+    refined_count = min(max(refined_count, 1), total_blocks)
+    selected = torch.topk(pressure.reshape(-1), refined_count).indices
+
+    flat_params = {
+        key: tensor.reshape(total_blocks, *tensor.shape[2:])
+        for key, tensor in weight_params.items()
+    }
+    flat_reconstructed = reconstructed.reshape(rows, block_count, HIF4_BLOCK_SIZE)
+
+    for start in range(0, refined_count, _SPARSE_HESSIAN_CHUNK_BLOCKS):
+        end = min(start + _SPARSE_HESSIAN_CHUNK_BLOCKS, refined_count)
+        flat_index = selected[start:end]
+        row_index = flat_index // block_count
+        block_index = flat_index % block_count
+        batch_values = values_blocks[row_index, block_index]
+        batch_base = flat_params["scale_factor"][flat_index].reshape(-1)
+        batch_params = {key: value[flat_index] for key, value in flat_params.items()}
+        choices = _initial_hessian_choices(batch_params)
+        candidate_params, candidate_values = _sweep_sparse_hessian_blocks(
+            batch_values,
+            batch_base,
+            choices,
+            full_hessian[block_index],
+        )
+        baseline_error = batch_values - flat_reconstructed[row_index, block_index]
+        candidate_error = batch_values - candidate_values
+        baseline_full, _ = _hessian_loss_and_product(
+            baseline_error, full_hessian[block_index]
+        )
+        candidate_full, _ = _hessian_loss_and_product(
+            candidate_error, full_hessian[block_index]
+        )
+        baseline_left, _ = _hessian_loss_and_product(
+            baseline_error, left_hessian[block_index]
+        )
+        candidate_left, _ = _hessian_loss_and_product(
+            candidate_error, left_hessian[block_index]
+        )
+        baseline_right, _ = _hessian_loss_and_product(
+            baseline_error, right_hessian[block_index]
+        )
+        candidate_right, _ = _hessian_loss_and_product(
+            candidate_error, right_hessian[block_index]
+        )
+        accept = (
+            (candidate_full < baseline_full * (1.0 - _SPARSE_HESSIAN_MIN_IMPROVEMENT))
+            & (candidate_left < baseline_left * (1.0 - _SPARSE_HESSIAN_MIN_IMPROVEMENT))
+            & (candidate_right < baseline_right * (1.0 - _SPARSE_HESSIAN_MIN_IMPROVEMENT))
+        )
+        if bool(accept.any()):
+            accepted_index = flat_index[accept]
+            for key, value in flat_params.items():
+                value[accepted_index] = candidate_params[key][accept]
+
+    return weight_params
+
+
 @torch.inference_mode()
 def hif4_calibration_and_quantize_weight(
     weight_quant: torch.Tensor,
@@ -301,11 +557,40 @@ def hif4_calibration_and_quantize_weight(
 ) -> dict[str, Any]:
     weight = _restore_dense(weight_quant, weight_scale)
     channels = int(weight.shape[-1])
+    rows = int(weight.shape[0]) if weight.ndim >= 2 else 0
     act_absmax, act_squares, act_count = _calibration_statistics(
         calib_activation_list, channels, weight.device
     )
     smooth = _smooth_scale(weight, act_absmax, act_squares, act_count)
     transformed_weight = _transform(weight, smooth, inverse=False)
+    transformed_activation_rows: list[torch.Tensor] = []
+    use_sparse_hessian = (
+        _USE_SPARSE_HESSIAN_WEIGHT_REFINEMENT
+        and len(calib_activation_list) >= _SPARSE_HESSIAN_MIN_CALIBRATION_SAMPLES
+        and rows >= _SPARSE_HESSIAN_MIN_WEIGHT_ROWS
+        and channels >= _SPARSE_HESSIAN_MIN_CHANNELS
+    )
+    if use_sparse_hessian:
+        for item in calib_activation_list:
+            if not isinstance(item, (tuple, list)) or len(item) < 2:
+                continue
+            activation = _restore_dense(item[0], item[1]).reshape(-1, channels)
+            activation = _transform(activation, smooth, inverse=True).reshape(
+                -1, channels
+            )
+            sample_rows = int(activation.shape[0])
+            keep_rows = min(sample_rows, _SPARSE_HESSIAN_CALIBRATION_ROWS)
+            if keep_rows <= 0:
+                continue
+            if keep_rows < sample_rows:
+                index = torch.linspace(
+                    0,
+                    sample_rows - 1,
+                    steps=keep_rows,
+                    device=activation.device,
+                ).round().to(torch.long)
+                activation = activation.index_select(0, index)
+            transformed_activation_rows.append(activation.contiguous())
 
     weight_importance = None
     if _USE_WEIGHT_IMPORTANCE:
@@ -333,6 +618,12 @@ def hif4_calibration_and_quantize_weight(
         weight_importance,
         _WEIGHT_BASE_OFFSETS,
     )
+    if use_sparse_hessian:
+        weight_params = _apply_sparse_hessian_weight_refinement(
+            transformed_weight,
+            weight_params,
+            transformed_activation_rows,
+        )
     activation_importance = None
     if _USE_ACTIVATION_IMPORTANCE:
         converted_weight = _dequantize_hif4_params(weight_params).float()
@@ -518,3 +809,16 @@ def hif4_dynamic_quantize_v(
     if _USE_MULTIBASE_V and state.get("base_search") == 3:
         return _quantize_dense(values, base_offsets=(0, -1, 1), min_relative_improvement=0.01)
     return _quantize_dense(values)
+
+
+def hif4_dynamic_quantize_v(v_quant, v_scale, kv_num_heads, head_dim, v_state):
+    del kv_num_heads, head_dim
+    values = _restore_dense(v_quant, v_scale)
+    state = v_state if isinstance(v_state, Mapping) else {}
+    offsets = (0, -1, 1, -2, 2) if state.get("base_search") == 3 else (0,)
+    return _quantize_dense(
+        values,
+        base_offsets=offsets,
+        min_relative_improvement=0.01,
+    )
+
