@@ -1,4 +1,4 @@
-"""Standalone matrix- and Attention-adaptive HiF4 v2 candidate.
+"""Linear transform candidate for HiF4 v2.
 
 The Linear path applies a diagonal Smooth transform followed by the same
 orthonormal Walsh-Hadamard transform to every 64 input channels.  For row
@@ -7,9 +7,8 @@ point product is unchanged because ``H H.T = I``.  The default uses the root
 exact hierarchy DP; optional diagonal weighting remains only as an ablation
 knob and never forms ``A @ W.T``.
 
-Attention uses a reciprocal Smooth-QK transform followed by the same H64.
-A calibration-only structural/stability gate limits it to sufficiently grouped,
-repeatable GQA; rejected layouts fall back to the exact fixed-base path.
+The Attention entry points deliberately retain the root v1 conversion so this
+file isolates the Linear direction.
 """
 
 from __future__ import annotations
@@ -42,11 +41,6 @@ _IMPORTANCE_MAX = 64.0
 _IMPORTANCE_POWER = 0.5
 _WEIGHT_BASE_OFFSETS = (0,)
 _ACTIVATION_BASE_OFFSETS = (0,)
-_USE_MULTIBASE_V = True
-_ATTENTION_MIN_GQA_RATIO = 4
-_ATTENTION_MIN_CALIBRATION_SAMPLES = 2
-_ATTENTION_MAX_LOG_SMOOTH_STD = 0.22
-_ATTENTION_MAX_CROSS_SAMPLE_STD = 0.16
 
 
 class HiF4Params(TypedDict):
@@ -178,7 +172,6 @@ def _quantize_dense(
     values: torch.Tensor,
     importance: torch.Tensor | None = None,
     base_offsets: tuple[int, ...] = (0,),
-    min_relative_improvement: float = 0.0,
 ) -> HiF4Params:
     channels = int(values.shape[-1])
     if channels % HIF4_BLOCK_SIZE:
@@ -194,17 +187,12 @@ def _quantize_dense(
     best_base = None
     best_lv2 = None
     best_lv3 = None
-    baseline_loss = None
-    baseline_lv2 = None
-    baseline_lv3 = None
     for offset in base_offsets:
         base = nominal if offset == 0 else _e6m2_neighbor(nominal, offset)
         loss, lv2_bit, lv3_bit = _solve_hierarchy(absolute, base, importance)
         if best_loss is None:
             best_loss, best_base = loss, base
             best_lv2, best_lv3 = lv2_bit, lv3_bit
-            baseline_loss = loss
-            baseline_lv2, baseline_lv3 = lv2_bit, lv3_bit
         else:
             improve = loss < best_loss
             best_loss = torch.where(improve, loss, best_loss)
@@ -213,15 +201,6 @@ def _quantize_dense(
             best_lv3 = torch.where(improve[:, None, None] if improve.ndim == 1 else improve.unsqueeze(-1).unsqueeze(-1), lv3_bit, best_lv3)
 
     assert best_base is not None and best_lv2 is not None and best_lv3 is not None
-    if min_relative_improvement:
-        assert baseline_loss is not None
-        assert baseline_lv2 is not None and baseline_lv3 is not None
-        accept = best_loss < baseline_loss * (1.0 - min_relative_improvement)
-        best_base = torch.where(accept, best_base, nominal)
-        best_lv2 = torch.where(accept.unsqueeze(-1), best_lv2, baseline_lv2)
-        best_lv3 = torch.where(
-            accept.unsqueeze(-1).unsqueeze(-1), best_lv3, baseline_lv3
-        )
     scale_lv2 = best_lv2.float().add_(1.0)
     scale_lv3 = best_lv3.float().add_(1.0)
     total_scale = scale_lv2.unsqueeze(-1) * scale_lv3
@@ -362,159 +341,38 @@ def hif4_dynamic_quantize_activation(
     return _quantize_dense(transformed, importance, _ACTIVATION_BASE_OFFSETS)
 
 
-def _unpack_qk(item: Any) -> tuple[Any, Any]:
-    if isinstance(item, Mapping):
-        return item["q"], item["k"]
-    if not isinstance(item, (tuple, list)) or len(item) < 4:
-        raise ValueError("Attention calibration item must contain Q/K/V pairs")
-    return item[0:2], item[2:4]
-
-
-def _attention_transform(
-    values: torch.Tensor,
-    smooth: torch.Tensor,
-    heads: int,
-    head_dim: int,
-    inverse: bool,
-) -> torch.Tensor:
-    if values.shape[-1] != heads * head_dim or head_dim % HIF4_BLOCK_SIZE:
-        raise ValueError("Attention tensor has an incompatible flattened head layout")
-    headed = values.reshape(-1, heads, head_dim)
-    local = smooth.to(device=values.device, dtype=torch.float32)
-    headed = headed / local if inverse else headed * local
-    return _hadamard64(headed.reshape_as(values))
-
-
+# Attention remains the root exact-DP path for isolation.
 @torch.inference_mode()
 def hif4_calibration_attention(
-    calib_qkv_list: list,
-    q_num_heads: int,
-    kv_num_heads: int,
-    head_dim: int,
+    calib_qkv_list: list, q_num_heads: int, kv_num_heads: int, head_dim: int,
 ) -> dict[str, Any]:
-    if q_num_heads % kv_num_heads:
-        raise ValueError("q_num_heads must be divisible by kv_num_heads")
-    if head_dim not in (64, 128, 256):
-        raise ValueError("head_dim must be 64, 128 or 256")
-    repeats = q_num_heads // kv_num_heads
-    q_moments: list[torch.Tensor] = []
-    k_moments: list[torch.Tensor] = []
-    sample_logs: list[torch.Tensor] = []
-    for item in calib_qkv_list:
-        q_pair, k_pair = _unpack_qk(item)
-        q = _restore_dense(*q_pair).reshape(-1, q_num_heads, head_dim)
-        k = _restore_dense(*k_pair).reshape(-1, kv_num_heads, head_dim)
-        q_moment = q.square().mean(dim=0)
-        k_moment = k.square().mean(dim=0)
-        grouped_q = q_moment.reshape(
-            kv_num_heads, repeats, head_dim
-        ).mean(dim=1)
-        sample_smooth = (
-            grouped_q.clamp_min(1.0e-20) / k_moment.clamp_min(1.0e-20)
-        ).pow(0.125)
-        sample_logs.append(torch.log2(sample_smooth.clamp(1.0 / 16.0, 16.0)))
-        q_moments.append(q_moment)
-        k_moments.append(k_moment)
-
-    apply_transform = False
-    log_smooth_std = 0.0
-    cross_sample_std = float("inf")
-    smooth_q: torch.Tensor | None = None
-    smooth_k: torch.Tensor | None = None
-    if q_moments:
-        q_moment = torch.stack(q_moments).mean(dim=0)
-        k_moment = torch.stack(k_moments).mean(dim=0)
-        grouped_q = q_moment.reshape(
-            kv_num_heads, repeats, head_dim
-        ).mean(dim=1)
-        smooth_k = (
-            grouped_q.clamp_min(1.0e-20) / k_moment.clamp_min(1.0e-20)
-        ).pow(0.125).clamp_(1.0 / 16.0, 16.0)
-        smooth_q = smooth_k.repeat_interleave(repeats, dim=0)
-        aggregate_log = torch.log2(smooth_k)
-        log_smooth_std = float(aggregate_log.std().item())
-        if len(sample_logs) >= 2:
-            cross_sample_std = float(
-                torch.stack(sample_logs).std(dim=0).mean().item()
-            )
-        apply_transform = (
-            repeats >= _ATTENTION_MIN_GQA_RATIO
-            and len(sample_logs) >= _ATTENTION_MIN_CALIBRATION_SAMPLES
-            and log_smooth_std <= _ATTENTION_MAX_LOG_SMOOTH_STD
-            and cross_sample_std <= _ATTENTION_MAX_CROSS_SAMPLE_STD
-        )
-
-    q_state = {
-        "version": 5,
-        "apply_transform": apply_transform,
-        "smooth": smooth_q if apply_transform else None,
-        "log_smooth_std": log_smooth_std,
-        "cross_sample_std": cross_sample_std if cross_sample_std != float("inf") else None,
-    }
-    k_state = {
-        "version": 5,
-        "apply_transform": apply_transform,
-        "smooth": smooth_k if apply_transform else None,
-        "log_smooth_std": log_smooth_std,
-        "cross_sample_std": cross_sample_std if cross_sample_std != float("inf") else None,
-    }
-    return {
-        "q_state": q_state,
-        "k_state": k_state,
-        "v_state": {
-            "version": 5,
-            "base_search": 3 if (_USE_MULTIBASE_V and apply_transform) else 1,
-        },
-    }
+    del calib_qkv_list, q_num_heads, kv_num_heads, head_dim
+    state = {"version": 2}
+    return {"q_state": state, "k_state": state, "v_state": state}
 
 
 @torch.inference_mode()
 def hif4_dynamic_quantize_q(
-    q_quant: torch.Tensor,
-    q_scale: torch.Tensor,
-    q_num_heads: int,
-    head_dim: int,
-    q_state: Any,
+    q_quant: torch.Tensor, q_scale: torch.Tensor, q_num_heads: int,
+    head_dim: int, q_state: Any,
 ) -> HiF4Params:
-    values = _restore_dense(q_quant, q_scale)
-    state = q_state if isinstance(q_state, Mapping) else {}
-    smooth = state.get("smooth")
-    if state.get("apply_transform") and isinstance(smooth, torch.Tensor):
-        values = _attention_transform(
-            values, smooth, q_num_heads, head_dim, inverse=True
-        )
-    return _quantize_dense(values)
+    del q_num_heads, head_dim, q_state
+    return _quantize_dense(_restore_dense(q_quant, q_scale))
 
 
 @torch.inference_mode()
 def hif4_dynamic_quantize_k(
-    k_quant: torch.Tensor,
-    k_scale: torch.Tensor,
-    kv_num_heads: int,
-    head_dim: int,
-    k_state: Any,
+    k_quant: torch.Tensor, k_scale: torch.Tensor, kv_num_heads: int,
+    head_dim: int, k_state: Any,
 ) -> HiF4Params:
-    values = _restore_dense(k_quant, k_scale)
-    state = k_state if isinstance(k_state, Mapping) else {}
-    smooth = state.get("smooth")
-    if state.get("apply_transform") and isinstance(smooth, torch.Tensor):
-        values = _attention_transform(
-            values, smooth, kv_num_heads, head_dim, inverse=False
-        )
-    return _quantize_dense(values)
+    del kv_num_heads, head_dim, k_state
+    return _quantize_dense(_restore_dense(k_quant, k_scale))
 
 
 @torch.inference_mode()
 def hif4_dynamic_quantize_v(
-    v_quant: torch.Tensor,
-    v_scale: torch.Tensor,
-    kv_num_heads: int,
-    head_dim: int,
-    v_state: Any,
+    v_quant: torch.Tensor, v_scale: torch.Tensor, kv_num_heads: int,
+    head_dim: int, v_state: Any,
 ) -> HiF4Params:
-    del kv_num_heads, head_dim
-    values = _restore_dense(v_quant, v_scale)
-    state = v_state if isinstance(v_state, Mapping) else {}
-    if _USE_MULTIBASE_V and state.get("base_search") == 3:
-        return _quantize_dense(values, base_offsets=(0, -1, 1), min_relative_improvement=0.01)
-    return _quantize_dense(values)
+    del kv_num_heads, head_dim, v_state
+    return _quantize_dense(_restore_dense(v_quant, v_scale))

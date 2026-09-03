@@ -1,0 +1,239 @@
+{
+  "audit": {
+    "attention_layout": "[tokens, heads * head_dim]; KV heads repeat_interleave for GQA",
+    "calibration_received_test_data": false,
+    "causal_mask": "upper-left, key_position <= query_position",
+    "quality_uses_linear_a_times_w_transpose": true,
+    "source_dequantization": "FP32 multiply rounded through BF16"
+  },
+  "candidate": {
+    "attention": {
+      "calibration_ms": 0.0454,
+      "cases": [
+        {
+          "case": 0,
+          "causal_mse": 0.0016708837356418371,
+          "causal_nmse": 0.010497244074940681,
+          "full_mse": 0.0016132357995957136,
+          "full_nmse": 0.010385999456048012
+        },
+        {
+          "case": 1,
+          "causal_mse": 0.0010300171561539173,
+          "causal_nmse": 0.009406676515936852,
+          "full_mse": 0.0008490798645652831,
+          "full_nmse": 0.00832250714302063
+        },
+        {
+          "case": 2,
+          "causal_mse": 0.0007102303206920624,
+          "causal_nmse": 0.007568384520709515,
+          "full_mse": 0.0005745743401348591,
+          "full_nmse": 0.006395184434950352
+        },
+        {
+          "case": 3,
+          "causal_mse": 0.0006818335386924446,
+          "causal_nmse": 0.006700168363749981,
+          "full_mse": 0.000564055924769491,
+          "full_nmse": 0.005857291631400585
+        },
+        {
+          "case": 4,
+          "causal_mse": 0.0006442684098146856,
+          "causal_nmse": 0.006770721171051264,
+          "full_mse": 0.0005183402681723237,
+          "full_nmse": 0.0057108160108327866
+        }
+      ],
+      "dynamic_ms": 141.3866,
+      "quantization_total_ms": 141.432,
+      "validation_errors": []
+    },
+    "linear": {
+      "calibration_ms": 491.4687,
+      "cases": [
+        {
+          "case": 0,
+          "mse": 0.017167706042528152,
+          "nmse": 0.0013341745361685753
+        },
+        {
+          "case": 1,
+          "mse": 0.014063281938433647,
+          "nmse": 0.0012761749094352126
+        },
+        {
+          "case": 2,
+          "mse": 0.014723177999258041,
+          "nmse": 0.0015478582354262471
+        },
+        {
+          "case": 3,
+          "mse": 0.013590368442237377,
+          "nmse": 0.001610231469385326
+        },
+        {
+          "case": 4,
+          "mse": 0.014891843311488628,
+          "nmse": 0.0016917642205953598
+        }
+      ],
+      "dynamic_ms": 120.3,
+      "quantization_total_ms": 611.7687,
+      "validation_errors": []
+    }
+  },
+  "candidate_path": "E:\\Eproject\\HiFCon\\workbench\\solution_v2_multibase_candidate.py",
+  "comparison": {
+    "attention_causal_case_gain_percent": [
+      9.38695457889768,
+      5.716002889970142,
+      6.943202903037135,
+      7.496563442674307,
+      7.2936466549752605
+    ],
+    "attention_causal_macro_gain_percent": 7.367274093910905,
+    "attention_full_case_gain_percent": [
+      7.823267670711929,
+      5.674860391550294,
+      7.406921373693865,
+      8.249439696518179,
+      8.001697600280012
+    ],
+    "attention_full_macro_gain_percent": 7.431237346550856,
+    "candidate_quantization_ms": 703.7530000000003,
+    "control_quantization_ms": 350.1527000000001,
+    "linear_case_gain_percent": [
+      12.310872182604298,
+      8.519560569192032,
+      5.198326288373682,
+      6.3579791536238845,
+      3.555602655231498
+    ],
+    "linear_macro_gain_percent": 7.188468169805079,
+    "max_mse_nmse_gain_delta_percent": 6.535264663654061e-06,
+    "mse_nmse_gain_consistent": true,
+    "overall_macro_gain_percent": 7.3289932034222804,
+    "passes_five_percent_accuracy_gate": true,
+    "passes_legality_and_state_gate": true,
+    "runtime_ratio": 2.0098459900494845,
+    "validation_errors": [],
+    "worst_case_gain_percent": 3.555602655231498
+  },
+  "control": {
+    "attention": {
+      "calibration_ms": 0.04,
+      "cases": [
+        {
+          "case": 0,
+          "causal_mse": 0.0018439770210534334,
+          "causal_nmse": 0.011584693565964699,
+          "full_mse": 0.0017501551192253828,
+          "full_nmse": 0.011267484165728092
+        },
+        {
+          "case": 1,
+          "causal_mse": 0.0010924623347818851,
+          "causal_nmse": 0.00997695978730917,
+          "full_mse": 0.0009001628495752811,
+          "full_nmse": 0.008823212236166
+        },
+        {
+          "case": 2,
+          "causal_mse": 0.0007632224005647004,
+          "causal_nmse": 0.008133080787956715,
+          "full_mse": 0.0006205370300449431,
+          "full_nmse": 0.006906762719154358
+        },
+        {
+          "case": 3,
+          "causal_mse": 0.0007370899547822773,
+          "causal_nmse": 0.0072431559674441814,
+          "full_mse": 0.0006147710955701768,
+          "full_nmse": 0.006383930332958698
+        },
+        {
+          "case": 4,
+          "causal_mse": 0.0006949560483917594,
+          "causal_nmse": 0.007303405553102493,
+          "full_mse": 0.0005634237313643098,
+          "full_nmse": 0.00620752340182662
+        }
+      ],
+      "dynamic_ms": 143.456,
+      "quantization_total_ms": 143.49599999999998,
+      "validation_errors": []
+    },
+    "linear": {
+      "calibration_ms": 327.4818,
+      "cases": [
+        {
+          "case": 0,
+          "mse": 0.01957791857421398,
+          "nmse": 0.001521482365205884
+        },
+        {
+          "case": 1,
+          "mse": 0.015372993424534798,
+          "nmse": 0.001395024941302836
+        },
+        {
+          "case": 2,
+          "mse": 0.015530504286289215,
+          "nmse": 0.0016327330376952887
+        },
+        {
+          "case": 3,
+          "mse": 0.014513108879327774,
+          "nmse": 0.0017195608234032989
+        },
+        {
+          "case": 4,
+          "mse": 0.015440858900547028,
+          "nmse": 0.0017541343113407493
+        }
+      ],
+      "dynamic_ms": 67.7989,
+      "quantization_total_ms": 395.2807,
+      "validation_errors": []
+    }
+  },
+  "control_path": "E:\\Eproject\\HiFCon\\solution.py",
+  "dataset_dir": "E:\\Eproject\\HiFCon\\.tmp\\quantizer-public\\data",
+  "timing": {
+    "candidate": {
+      "median_suite_ms": 703.7530000000003,
+      "stage_call_median_ms": {
+        "attention_calibration": 0.0079,
+        "attention_dynamic": 4.7139,
+        "linear_calibration": 460.5531,
+        "linear_dynamic": 18.0905
+      },
+      "suite_ms": [
+        723.3825,
+        703.7530000000003,
+        702.6199999999999
+      ]
+    },
+    "control": {
+      "median_suite_ms": 350.1527000000001,
+      "stage_call_median_ms": {
+        "attention_calibration": 0.0127,
+        "attention_dynamic": 3.7678,
+        "linear_calibration": 185.194,
+        "linear_dynamic": 7.7052
+      },
+      "suite_ms": [
+        364.83560000000006,
+        350.1527000000001,
+        347.4439
+      ]
+    },
+    "randomized_paired_interleaving": true,
+    "repeats": 3,
+    "runtime_ratio": 2.0098459900494845,
+    "seed": 20260903,
+    "warmups": 1
+  }
+}

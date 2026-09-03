@@ -1,0 +1,239 @@
+{
+  "audit": {
+    "attention_layout": "[tokens, heads * head_dim]; KV heads repeat_interleave for GQA",
+    "calibration_received_test_data": false,
+    "causal_mask": "upper-left, key_position <= query_position",
+    "quality_uses_linear_a_times_w_transpose": true,
+    "source_dequantization": "FP32 multiply rounded through BF16"
+  },
+  "candidate": {
+    "attention": {
+      "calibration_ms": 67.458,
+      "cases": [
+        {
+          "case": 0,
+          "causal_mse": 0.0012455419637262821,
+          "causal_nmse": 0.007825056090950966,
+          "full_mse": 0.001107564545236528,
+          "full_nmse": 0.0071304915472865105
+        },
+        {
+          "case": 1,
+          "causal_mse": 0.0007475424790754914,
+          "causal_nmse": 0.006826964672654867,
+          "full_mse": 0.0006238287896849215,
+          "full_nmse": 0.006114642135798931
+        },
+        {
+          "case": 2,
+          "causal_mse": 0.0005255775758996606,
+          "causal_nmse": 0.005600680597126484,
+          "full_mse": 0.00042850960744544864,
+          "full_nmse": 0.004769440274685621
+        },
+        {
+          "case": 3,
+          "causal_mse": 0.0005230853566899896,
+          "causal_nmse": 0.005140198860317469,
+          "full_mse": 0.00042333087185397744,
+          "full_nmse": 0.004395969212055206
+        },
+        {
+          "case": 4,
+          "causal_mse": 0.0004771502281073481,
+          "causal_nmse": 0.005014448892325163,
+          "full_mse": 0.00038464166573248804,
+          "full_nmse": 0.004237791057676077
+        }
+      ],
+      "dynamic_ms": 185.56529999999998,
+      "quantization_total_ms": 253.02329999999998,
+      "validation_errors": []
+    },
+    "linear": {
+      "calibration_ms": 256.8343,
+      "cases": [
+        {
+          "case": 0,
+          "mse": 0.01957791857421398,
+          "nmse": 0.001521482365205884
+        },
+        {
+          "case": 1,
+          "mse": 0.015372993424534798,
+          "nmse": 0.001395024941302836
+        },
+        {
+          "case": 2,
+          "mse": 0.015530504286289215,
+          "nmse": 0.0016327330376952887
+        },
+        {
+          "case": 3,
+          "mse": 0.014513108879327774,
+          "nmse": 0.0017195608234032989
+        },
+        {
+          "case": 4,
+          "mse": 0.015440858900547028,
+          "nmse": 0.0017541343113407493
+        }
+      ],
+      "dynamic_ms": 60.386700000000005,
+      "quantization_total_ms": 317.221,
+      "validation_errors": []
+    }
+  },
+  "candidate_path": "E:\\Eproject\\HiFCon\\workbench\\solution_v2_attention_candidate.py",
+  "comparison": {
+    "attention_causal_case_gain_percent": [
+      32.45349863336558,
+      31.572700012148104,
+      31.137034826180262,
+      29.033715180055705,
+      31.34094894036093
+    ],
+    "attention_causal_macro_gain_percent": 31.107579518422114,
+    "attention_full_case_gain_percent": [
+      36.71620686246742,
+      30.698229772617346,
+      30.94536076043466,
+      31.14008207211594,
+      31.73136942579745
+    ],
+    "attention_full_macro_gain_percent": 32.24624977868656,
+    "candidate_quantization_ms": 878.2914000000001,
+    "control_quantization_ms": 567.6895999999999,
+    "linear_case_gain_percent": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "linear_macro_gain_percent": 0.0,
+    "max_mse_nmse_gain_delta_percent": 7.709277809908599e-06,
+    "mse_nmse_gain_consistent": true,
+    "overall_macro_gain_percent": 21.117943099036225,
+    "passes_five_percent_accuracy_gate": true,
+    "passes_legality_and_state_gate": true,
+    "runtime_ratio": 1.5471331516377969,
+    "validation_errors": [],
+    "worst_case_gain_percent": 0.0
+  },
+  "control": {
+    "attention": {
+      "calibration_ms": 0.0407,
+      "cases": [
+        {
+          "case": 0,
+          "causal_mse": 0.0018439770210534334,
+          "causal_nmse": 0.011584693565964699,
+          "full_mse": 0.0017501551192253828,
+          "full_nmse": 0.011267484165728092
+        },
+        {
+          "case": 1,
+          "causal_mse": 0.0010924623347818851,
+          "causal_nmse": 0.00997695978730917,
+          "full_mse": 0.0009001628495752811,
+          "full_nmse": 0.008823212236166
+        },
+        {
+          "case": 2,
+          "causal_mse": 0.0007632224005647004,
+          "causal_nmse": 0.008133080787956715,
+          "full_mse": 0.0006205370300449431,
+          "full_nmse": 0.006906762719154358
+        },
+        {
+          "case": 3,
+          "causal_mse": 0.0007370899547822773,
+          "causal_nmse": 0.0072431559674441814,
+          "full_mse": 0.0006147710955701768,
+          "full_nmse": 0.006383930332958698
+        },
+        {
+          "case": 4,
+          "causal_mse": 0.0006949560483917594,
+          "causal_nmse": 0.007303405553102493,
+          "full_mse": 0.0005634237313643098,
+          "full_nmse": 0.00620752340182662
+        }
+      ],
+      "dynamic_ms": 120.8671,
+      "quantization_total_ms": 120.9078,
+      "validation_errors": []
+    },
+    "linear": {
+      "calibration_ms": 234.2622,
+      "cases": [
+        {
+          "case": 0,
+          "mse": 0.01957791857421398,
+          "nmse": 0.001521482365205884
+        },
+        {
+          "case": 1,
+          "mse": 0.015372993424534798,
+          "nmse": 0.001395024941302836
+        },
+        {
+          "case": 2,
+          "mse": 0.015530504286289215,
+          "nmse": 0.0016327330376952887
+        },
+        {
+          "case": 3,
+          "mse": 0.014513108879327774,
+          "nmse": 0.0017195608234032989
+        },
+        {
+          "case": 4,
+          "mse": 0.015440858900547028,
+          "nmse": 0.0017541343113407493
+        }
+      ],
+      "dynamic_ms": 44.4345,
+      "quantization_total_ms": 278.6967,
+      "validation_errors": []
+    }
+  },
+  "control_path": "E:\\Eproject\\HiFCon\\solution.py",
+  "dataset_dir": "E:\\Eproject\\HiFCon\\.tmp\\quantizer-public\\data",
+  "timing": {
+    "candidate": {
+      "median_suite_ms": 878.2914000000001,
+      "stage_call_median_ms": {
+        "attention_calibration": 141.4074,
+        "attention_dynamic": 8.6774,
+        "linear_calibration": 317.1117,
+        "linear_dynamic": 13.4675
+      },
+      "suite_ms": [
+        906.5072999999998,
+        878.2914000000001,
+        841.7304000000003
+      ]
+    },
+    "control": {
+      "median_suite_ms": 567.6895999999999,
+      "stage_call_median_ms": {
+        "attention_calibration": 0.0292,
+        "attention_dynamic": 6.1859,
+        "linear_calibration": 282.3211,
+        "linear_dynamic": 12.2586
+      },
+      "suite_ms": [
+        573.5659,
+        544.6116999999999,
+        567.6895999999999
+      ]
+    },
+    "randomized_paired_interleaving": true,
+    "repeats": 3,
+    "runtime_ratio": 1.5471331516377969,
+    "seed": 20260903,
+    "warmups": 1
+  }
+}
