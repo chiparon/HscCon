@@ -591,8 +591,9 @@ def _sweep_local_scales(
     hessian: torch.Tensor,
     group_hessians: list[torch.Tensor],
     shared_block_count: int | None = None,
+    rounds: int = _HESSIAN_SWEEP_ROUNDS,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Two rounds of per-group coordinate descent under the block Hessian."""
+    """Run the requested coordinate-descent rounds under the block Hessian."""
 
     row_count = int(values.shape[0])
     choices = init_choices.clone()
@@ -608,7 +609,7 @@ def _sweep_local_scales(
     changes = torch.zeros(row_count, dtype=torch.int64, device=values.device)
     cache = _combo_cache(abs_values, sign_values, global_scale)
 
-    for _ in range(_HESSIAN_SWEEP_ROUNDS):
+    for _ in range(rounds):
         for group in range(8):
             start = group * 8
             group_reconstructed = reconstructed[:, start:start + 8]
@@ -804,6 +805,9 @@ def _quantize_hif4_block_hessian_weight(
         best: tuple | None = None
         for candidate in range(int(candidate_scales.shape[1])):
             scale = candidate_scales[:, candidate]
+            # Only the outer stage-one multipliers use a shortened sweep.
+            # Indices 2..6 are 0.85, 1.0, 1.2, 1.5, and 2.0 respectively.
+            stage_one_rounds = 2 if 2 <= candidate <= 6 else 1
             loss, changes, choices = _sweep_local_scales(
                 batch_values,
                 batch_abs,
@@ -813,6 +817,7 @@ def _quantize_hif4_block_hessian_weight(
                 hessian_reg,
                 group_hessians,
                 block_count,
+                rounds=stage_one_rounds,
             )
             best = _pick_hessian_candidate(best, loss, changes, scale, choices)
 
