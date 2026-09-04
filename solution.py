@@ -214,6 +214,14 @@ def _evaluate_hif4_scale_candidates(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return total errors and local exponent choices for global scales."""
 
+    # Original options 3 and 4 both materialize the same local scale [2, 2].
+    # Evaluate the earlier representative only, then restore original indices
+    # so callers retain the complete eight-option choice universe.
+    local_scale_options = torch.cat(
+        (local_scale_options[:4], local_scale_options[5:]),
+        dim=0,
+    )
+
     # values       [block, candidate, lv2-group, option, lv3-group, value]
     # local scales [1,     1,         1,         option, lv3-group, 1]
     values = abs_block[:, None, :, None, :, :]
@@ -235,6 +243,7 @@ def _evaluate_hif4_scale_candidates(
     # Each 8-value group independently chooses one of the 8 legal local
     # exponent combinations.  Their errors then sum for the 64-value block.
     local_error, local_choice = squared_error.min(dim=-1)
+    local_choice = local_choice + (local_choice >= 4).to(local_choice.dtype)
     return local_error.sum(dim=-1), local_choice
 
 
