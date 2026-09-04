@@ -251,7 +251,9 @@ def _quantize_hif4(
     x: torch.Tensor,
     error_weights: torch.Tensor | None = None,
     enable_refinement: bool = True,
-) -> dict[str, torch.Tensor]:
+    *,
+    return_stage1_local_choices: bool = False,
+) -> dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], torch.Tensor]:
     """Quantize FP32 values with guarded two-stage weighted MSE search."""
 
     if not isinstance(x, torch.Tensor):
@@ -260,6 +262,8 @@ def _quantize_hif4(
         raise ValueError("x must have at least one dimension")
     if type(enable_refinement) is not bool:
         raise TypeError("enable_refinement must be a bool")
+    if type(return_stage1_local_choices) is not bool:
+        raise TypeError("return_stage1_local_choices must be a bool")
 
     channels = int(x.shape[-1])
     if channels % _HIF4_BLOCK_SIZE != 0:
@@ -313,6 +317,17 @@ def _quantize_hif4(
         (total_blocks, 8, 2, 4), dtype=torch.float32, device=device
     )
     mant_out = torch.empty_like(sign_out)
+    stage1_local_choices_out: torch.Tensor | None = None
+    if return_stage1_local_choices:
+        stage1_local_choices_out = torch.empty(
+            (
+                total_blocks,
+                len(_LINEAR_HESSIAN_GLOBAL_SCALE_MULTIPLIERS),
+                8,
+            ),
+            dtype=torch.uint8,
+            device=device,
+        )
 
     multipliers = torch.tensor(
         _GLOBAL_SCALE_MULTIPLIERS,
@@ -343,6 +358,8 @@ def _quantize_hif4(
             local_scale_options,
             weight_block,
         )
+        if stage1_local_choices_out is not None:
+            stage1_local_choices_out[start:end] = local_choice[:, 2:]
         global_choice = global_error.argmin(dim=-1)
 
         row_index = torch.arange(end - start, device=device)
@@ -418,7 +435,7 @@ def _quantize_hif4(
         sign_out[start:end] = chosen_sign
         mant_out[start:end] = chosen_mant
 
-    return {
+    result = {
         "scale_factor": scale_factor_out.reshape(
             prefix + (block_count_per_row, 1, 1, 1)
         ).contiguous(),
@@ -435,6 +452,9 @@ def _quantize_hif4(
             prefix + (block_count_per_row, 8, 2, 4)
         ).contiguous(),
     }
+    if stage1_local_choices_out is not None:
+        return result, stage1_local_choices_out
+    return result
 
 
 def _quantize_nvfp4_pair(
@@ -723,6 +743,7 @@ def _quantize_hif4_block_hessian_weight(
     error_weights: torch.Tensor,
     hessian_reg: torch.Tensor,
     v4_params: dict,
+    stage1_local_choices: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Quantize transformed Weight rows with guarded block-Hessian search."""
 
@@ -747,6 +768,17 @@ def _quantize_hif4_block_hessian_weight(
 
     out = {key: torch.empty_like(v4_flat[key]) for key in v4_flat}
     total_blocks = rows * block_count
+    if stage1_local_choices is not None:
+        expected_shape = (
+            total_blocks,
+            len(_LINEAR_HESSIAN_GLOBAL_SCALE_MULTIPLIERS),
+            8,
+        )
+        if tuple(stage1_local_choices.shape) != expected_shape:
+            raise ValueError(
+                "stage1_local_choices shape "
+                f"{tuple(stage1_local_choices.shape)} != {expected_shape}"
+            )
 
     multipliers = torch.tensor(
         _LINEAR_HESSIAN_GLOBAL_SCALE_MULTIPLIERS,
@@ -795,12 +827,15 @@ def _quantize_hif4_block_hessian_weight(
         candidate_scales = _snap_to_e6m2(
             base_scale.unsqueeze(-1) * multipliers.unsqueeze(0)
         )
-        _, local_choices = _evaluate_hif4_scale_candidates(
-            batch_abs.view(batch_size, 8, 2, 4),
-            candidate_scales,
-            local_scale_options,
-            batch_weights,
-        )
+        if stage1_local_choices is None:
+            _, local_choices = _evaluate_hif4_scale_candidates(
+                batch_abs.view(batch_size, 8, 2, 4),
+                candidate_scales,
+                local_scale_options,
+                batch_weights,
+            )
+        else:
+            local_choices = stage1_local_choices[start:end].to(dtype=torch.int64)
 
         best: tuple | None = None
         for candidate in range(int(candidate_scales.shape[1])):
@@ -1156,12 +1191,17 @@ def hif4_calibration_and_quantize_weight(
     # v5: replace the diagonal objective with the damped per-block Hessian.
     # The exact v4 parameters remain the guard candidate for every block.
     hessian_reg = _build_block_hessian_reg(transformed_activations, channels)
-    v4_weight_params = _quantize_hif4(transformed_weight, activation_second)
+    v4_weight_params, stage1_local_choices = _quantize_hif4(
+        transformed_weight,
+        activation_second,
+        return_stage1_local_choices=True,
+    )
     weight_params = _quantize_hif4_block_hessian_weight(
         transformed_weight,
         activation_second,
         hessian_reg,
         v4_weight_params,
+        stage1_local_choices,
     )
 
     activation_importance = transformed_weight.square().sum(dim=0).clamp_min(1.0e-8)
