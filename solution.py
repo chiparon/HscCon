@@ -696,9 +696,14 @@ def _quantize_hif4_block_hessian_weight(
     values: torch.Tensor,
     error_weights: torch.Tensor,
     hessian_reg: torch.Tensor,
-    v4_params: dict,
 ) -> dict[str, torch.Tensor]:
-    """Quantize transformed Weight rows with guarded block-Hessian search."""
+    """Quantize transformed Weight rows with block-Hessian search only.
+
+    This experimental path intentionally omits the v4 reconstruction and
+    per-block replacement gate.  Every block is selected from the v5 Hessian
+    search result, which removes the extra guarded-reference quantization
+    pass during Linear calibration.
+    """
 
     rows, channels = values.shape
     block_count = channels // _HIF4_BLOCK_SIZE
@@ -707,20 +712,8 @@ def _quantize_hif4_block_hessian_weight(
     sign_blocks = torch.sign(block_values)
     block_index = torch.arange(rows * block_count) % block_count
     weight_blocks = error_weights.reshape(block_count, 64)
-    v4_flat = {
-        key: tensor.reshape(rows * block_count, *tensor.shape[2:])
-        for key, tensor in v4_params.items()
-    }
-    v4_reconstructed = (
-        v4_flat["sign"]
-        * v4_flat["mant"]
-        * v4_flat["scale_lv2"]
-        * v4_flat["scale_lv3"]
-        * v4_flat["scale_factor"]
-    ).reshape(rows * block_count, 64)
-
-    out = {key: torch.empty_like(v4_flat[key]) for key in v4_flat}
     total_blocks = rows * block_count
+    out: dict[str, torch.Tensor] | None = None
 
     multipliers = torch.tensor(
         _GLOBAL_SCALE_MULTIPLIERS,
@@ -756,13 +749,6 @@ def _quantize_hif4_block_hessian_weight(
             ]
             for g in range(8)
         ]
-
-        # Guard reference: the exact v4 parameters and their Hessian loss.
-        v4_loss, _ = _block_hessian_loss(
-            batch_values - v4_reconstructed[start:end],
-            hessian_reg,
-            block_count,
-        )
 
         # Stage 1: the frozen v4 universe of 12 global scale candidates.
         base_scale = batch_abs.amax(-1) / 7.0
@@ -832,7 +818,7 @@ def _quantize_hif4_block_hessian_weight(
                 choices,
             )
 
-        v5_loss, _, v5_scale, v5_choices = refined_best
+        _, _, v5_scale, v5_choices = refined_best
         _, v5_mantissa, v5_sign, _ = _materialize_hif4_values(
             batch_values,
             batch_abs,
@@ -849,17 +835,20 @@ def _quantize_hif4_block_hessian_weight(
             "mant": v5_mantissa,
         }
 
-        # A block is replaced only when the v5 candidate is strictly better
-        # than the exact v4 parameters by the frozen 1 percent gate.
-        use_v5 = v5_loss < v4_loss * (1.0 - _HESSIAN_MIN_REPLACE_IMPROVEMENT)
-        cond = use_v5.view(batch_size, 1, 1, 1)
-        for key in v4_flat:
-            out[key][start:end] = torch.where(
-                cond,
-                v5_params[key],
-                v4_flat[key][start:end],
-            )
+        if out is None:
+            out = {
+                key: torch.empty(
+                    (total_blocks, *tensor.shape[1:]),
+                    dtype=tensor.dtype,
+                    device=tensor.device,
+                )
+                for key, tensor in v5_params.items()
+            }
+        for key, tensor in v5_params.items():
+            out[key][start:end] = tensor
 
+    if out is None:
+        raise RuntimeError("Linear Weight must contain at least one HiF4 block")
     return {
         key: tensor.reshape(rows, block_count, *tensor.shape[1:]).contiguous()
         for key, tensor in out.items()
@@ -1123,22 +1112,19 @@ def hif4_calibration_and_quantize_weight(
     activation_second = activation_second / max(activation_count, 1)
     activation_second = activation_second.clamp_min(1.0e-8)
 
-    # v5: replace the diagonal objective with the damped per-block Hessian.
-    # The exact v4 parameters remain the guard candidate for every block.
+    # v5: use the damped per-block Hessian for every Weight block.
     hessian_reg = _build_block_hessian_reg(transformed_activations, channels)
-    v4_weight_params = _quantize_hif4(transformed_weight, activation_second)
     weight_params = _quantize_hif4_block_hessian_weight(
         transformed_weight,
         activation_second,
         hessian_reg,
-        v4_weight_params,
     )
 
     activation_importance = transformed_weight.square().sum(dim=0).clamp_min(1.0e-8)
     state = _make_state("activation")
     state.update({
         "schema_version": 6,
-        "algorithm": "hif4-v5-block-hessian-weight",
+        "algorithm": "hif4-v5-block-hessian-weight-no-v4-guard",
         "smooth_scale": smooth.detach().cpu().contiguous(),
         "error_weights": activation_importance.detach().cpu().contiguous(),
         "smooth_alpha": _LINEAR_SMOOTH_ALPHA,
