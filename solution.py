@@ -253,14 +253,16 @@ def _importance_from_channel_values(values: torch.Tensor) -> torch.Tensor:
 
 def _calibration_statistics(
     calibration: list, channels: int, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor, int]:
+) -> tuple[torch.Tensor, torch.Tensor, int, list[torch.Tensor]]:
     absmax = torch.zeros(channels, dtype=torch.float32, device=device)
     squares = torch.zeros_like(absmax)
     count = 0
+    decoded_activations: list[torch.Tensor] = []
     for item in calibration:
         if not isinstance(item, (tuple, list)) or len(item) < 2:
             continue
         values = _restore_dense(item[0], item[1]).reshape(-1, channels)
+        decoded_activations.append(values)
         if _SMOOTH_STAT == "absmax":
             absmax = torch.maximum(absmax, values.abs().amax(dim=0))
         else:
@@ -270,7 +272,7 @@ def _calibration_statistics(
         absmax.fill_(1.0)
         squares.fill_(1.0)
         count = 1
-    return absmax, squares, count
+    return absmax, squares, count, decoded_activations
 
 
 def _smooth_scale(
@@ -363,10 +365,11 @@ def _hessian_loss_and_product(
 
 
 def _initial_hessian_choices(
-    flat_params: Mapping[str, torch.Tensor],
+    scale_lv2: torch.Tensor,
+    scale_lv3: torch.Tensor,
 ) -> torch.Tensor:
-    lv2 = flat_params["scale_lv2"].squeeze(-1).squeeze(-1)
-    lv3 = flat_params["scale_lv3"].squeeze(-1)
+    lv2 = scale_lv2.squeeze(-1).squeeze(-1)
+    lv3 = scale_lv3.squeeze(-1)
     return (
         (lv2 > 1.5).to(torch.long) * 4
         + (lv3[:, :, 0] > 1.5).to(torch.long) * 2
@@ -378,7 +381,8 @@ def _materialize_fixed_base_blocks(
     values: torch.Tensor,
     base_scale: torch.Tensor,
     choices: torch.Tensor,
-) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    include_params: bool = True,
+) -> tuple[dict[str, torch.Tensor] | None, torch.Tensor]:
     device = values.device
     lv2_options, lv3_options = _hessian_local_scale_options(device)
     blocked = values.reshape(-1, 8, 2, 4)
@@ -393,6 +397,8 @@ def _materialize_fixed_base_blocks(
     mant.mul_(0.25)
     sign = torch.where(mant == 0, torch.zeros_like(blocked), torch.sign(blocked))
     reconstructed = (sign * mant * total_scale).reshape(-1, HIF4_BLOCK_SIZE)
+    if not include_params:
+        return None, reconstructed
     return {
         "scale_factor": base_scale[:, None, None, None],
         "scale_lv2": lv2[:, :, None, None],
@@ -407,12 +413,11 @@ def _sweep_sparse_hessian_blocks(
     base_scale: torch.Tensor,
     choices: torch.Tensor,
     hessian: torch.Tensor,
-) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     batch = int(values.shape[0])
-    params, reconstructed = _materialize_fixed_base_blocks(
-        values, base_scale, choices
+    _, reconstructed = _materialize_fixed_base_blocks(
+        values, base_scale, choices, include_params=False
     )
-    del params
     error = values - reconstructed
     _, hessian_error = _hessian_loss_and_product(error, hessian)
     lv2_options, lv3_options = _hessian_local_scale_options(values.device)
@@ -455,7 +460,10 @@ def _sweep_sparse_hessian_blocks(
             torch.bmm(hessian_columns, best_delta[:, :, None]).squeeze(-1)
         )
 
-    return _materialize_fixed_base_blocks(values, base_scale, choices)
+    _, reconstructed = _materialize_fixed_base_blocks(
+        values, base_scale, choices, include_params=False
+    )
+    return choices, reconstructed
 
 
 def _apply_sparse_hessian_weight_refinement(
@@ -501,35 +509,42 @@ def _apply_sparse_hessian_weight_refinement(
         flat_index = selected[start:end]
         row_index = flat_index // block_count
         block_index = flat_index % block_count
+        # Reuse each gathered Hessian in this selected chunk.  The same
+        # block_index mapping is otherwise materialized multiple times.
+        batch_full_hessian = full_hessian[block_index]
+        batch_left_hessian = left_hessian[block_index]
+        batch_right_hessian = right_hessian[block_index]
         batch_values = values_blocks[row_index, block_index]
         batch_base = flat_params["scale_factor"][flat_index].reshape(-1)
-        batch_params = {key: value[flat_index] for key, value in flat_params.items()}
-        choices = _initial_hessian_choices(batch_params)
-        candidate_params, candidate_values = _sweep_sparse_hessian_blocks(
+        choices = _initial_hessian_choices(
+            flat_params["scale_lv2"][flat_index],
+            flat_params["scale_lv3"][flat_index],
+        )
+        candidate_choices, candidate_values = _sweep_sparse_hessian_blocks(
             batch_values,
             batch_base,
             choices,
-            full_hessian[block_index],
+            batch_full_hessian,
         )
         baseline_error = batch_values - flat_reconstructed[row_index, block_index]
         candidate_error = batch_values - candidate_values
         baseline_full, _ = _hessian_loss_and_product(
-            baseline_error, full_hessian[block_index]
+            baseline_error, batch_full_hessian
         )
         candidate_full, _ = _hessian_loss_and_product(
-            candidate_error, full_hessian[block_index]
+            candidate_error, batch_full_hessian
         )
         baseline_left, _ = _hessian_loss_and_product(
-            baseline_error, left_hessian[block_index]
+            baseline_error, batch_left_hessian
         )
         candidate_left, _ = _hessian_loss_and_product(
-            candidate_error, left_hessian[block_index]
+            candidate_error, batch_left_hessian
         )
         baseline_right, _ = _hessian_loss_and_product(
-            baseline_error, right_hessian[block_index]
+            baseline_error, batch_right_hessian
         )
         candidate_right, _ = _hessian_loss_and_product(
-            candidate_error, right_hessian[block_index]
+            candidate_error, batch_right_hessian
         )
         accept = (
             (candidate_full < baseline_full * (1.0 - _SPARSE_HESSIAN_MIN_IMPROVEMENT))
@@ -538,8 +553,13 @@ def _apply_sparse_hessian_weight_refinement(
         )
         if bool(accept.any()):
             accepted_index = flat_index[accept]
+            candidate_params, _ = _materialize_fixed_base_blocks(
+                batch_values[accept],
+                batch_base[accept],
+                candidate_choices[accept],
+            )
             for key, value in flat_params.items():
-                value[accepted_index] = candidate_params[key][accept]
+                value[accepted_index] = candidate_params[key]
 
     return weight_params
 
@@ -552,50 +572,49 @@ def hif4_calibration_and_quantize_weight(
 ) -> dict[str, Any]:
     weight = _restore_dense(weight_quant, weight_scale)
     channels = int(weight.shape[-1])
-    act_absmax, act_squares, act_count = _calibration_statistics(
+    act_absmax, act_squares, act_count, decoded_activations = _calibration_statistics(
         calib_activation_list, channels, weight.device
     )
     smooth = _smooth_scale(weight, act_absmax, act_squares, act_count)
     transformed_weight = _transform(weight, smooth, inverse=False)
     transformed_activation_rows: list[torch.Tensor] = []
-    if _USE_SPARSE_HESSIAN_WEIGHT_REFINEMENT:
-        for item in calib_activation_list:
-            if not isinstance(item, (tuple, list)) or len(item) < 2:
-                continue
-            activation = _restore_dense(item[0], item[1]).reshape(-1, channels)
-            activation = _transform(activation, smooth, inverse=True).reshape(
-                -1, channels
-            )
-            sample_rows = int(activation.shape[0])
-            keep_rows = min(sample_rows, _SPARSE_HESSIAN_CALIBRATION_ROWS)
-            if keep_rows <= 0:
-                continue
-            if keep_rows < sample_rows:
-                index = torch.linspace(
-                    0,
-                    sample_rows - 1,
-                    steps=keep_rows,
-                    device=activation.device,
-                ).round().to(torch.long)
-                activation = activation.index_select(0, index)
-            transformed_activation_rows.append(activation.contiguous())
-
     weight_importance = None
+    transformed_squares = None
+    transformed_count = 0
     if _USE_WEIGHT_IMPORTANCE:
         # The diagonal proxy for W' error uses E[A'^2] per transformed channel.
         transformed_squares = torch.zeros(
             channels, dtype=torch.float32, device=weight.device
         )
-        transformed_count = 0
-        for item in calib_activation_list:
-            if not isinstance(item, (tuple, list)) or len(item) < 2:
-                continue
-            activation = _restore_dense(item[0], item[1])
+
+    # Both optional paths consume the same transformed calibration activations.
+    if _USE_SPARSE_HESSIAN_WEIGHT_REFINEMENT or _USE_WEIGHT_IMPORTANCE:
+        for activation in decoded_activations:
             activation = _transform(activation, smooth, inverse=True).reshape(
                 -1, channels
             )
-            transformed_squares.add_(activation.square().sum(dim=0))
-            transformed_count += activation.shape[0]
+            if _USE_SPARSE_HESSIAN_WEIGHT_REFINEMENT:
+                sample_rows = int(activation.shape[0])
+                keep_rows = min(sample_rows, _SPARSE_HESSIAN_CALIBRATION_ROWS)
+                if keep_rows > 0:
+                    if keep_rows < sample_rows:
+                        index = torch.linspace(
+                            0,
+                            sample_rows - 1,
+                            steps=keep_rows,
+                            device=activation.device,
+                        ).round().to(torch.long)
+                        sampled_activation = activation.index_select(0, index)
+                    else:
+                        sampled_activation = activation
+                    transformed_activation_rows.append(sampled_activation.contiguous())
+            if _USE_WEIGHT_IMPORTANCE:
+                transformed_squares.add_(activation.square().sum(dim=0))
+                transformed_count += activation.shape[0]
+    del decoded_activations
+
+    if _USE_WEIGHT_IMPORTANCE:
+        assert transformed_squares is not None
         if transformed_count:
             transformed_squares.div_(float(transformed_count))
         else:
