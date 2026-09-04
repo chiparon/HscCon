@@ -1093,15 +1093,10 @@ def hif4_calibration_and_quantize_weight(
         dtype=torch.float32,
         device=weight.device,
     )
-    # Retain one FP32 decode per calibration input only through the following
-    # Smooth+Hadamard pass.  This raises that pass's peak activation memory,
-    # but avoids decoding the same immutable inputs a second time.
-    decoded_activations: list[torch.Tensor] = []
     for quant, scale in calib_activation_list:
         activation = _dequantize_nvfp4_fp32(quant, scale)
         if int(activation.shape[-1]) != channels:
             raise ValueError("calibration activation channels do not match weight")
-        decoded_activations.append(activation)
         activation_abs_max = torch.maximum(
             activation_abs_max,
             activation.abs().amax(dim=tuple(range(activation.ndim - 1))),
@@ -1117,14 +1112,14 @@ def hif4_calibration_and_quantize_weight(
     activation_second = torch.zeros_like(smooth)
     activation_count = 0
     transformed_activations: list[torch.Tensor] = []
-    for activation in decoded_activations:
+    for quant, scale in calib_activation_list:
+        activation = _dequantize_nvfp4_fp32(quant, scale)
         transformed = _apply_block_hadamard(activation / smooth)
         transformed_activations.append(transformed)
         activation_second += transformed.square().sum(
             dim=tuple(range(transformed.ndim - 1))
         )
         activation_count += transformed.numel() // channels
-    del decoded_activations
     activation_second = activation_second / max(activation_count, 1)
     activation_second = activation_second.clamp_min(1.0e-8)
 
