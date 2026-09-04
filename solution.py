@@ -253,6 +253,7 @@ def _quantize_hif4(
     enable_refinement: bool = True,
     *,
     return_stage1_local_choices: bool = False,
+    adaptive_linear_guard: bool = False,
 ) -> dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], torch.Tensor]:
     """Quantize FP32 values with guarded two-stage weighted MSE search."""
 
@@ -264,6 +265,8 @@ def _quantize_hif4(
         raise TypeError("enable_refinement must be a bool")
     if type(return_stage1_local_choices) is not bool:
         raise TypeError("return_stage1_local_choices must be a bool")
+    if type(adaptive_linear_guard) is not bool:
+        raise TypeError("adaptive_linear_guard must be a bool")
 
     channels = int(x.shape[-1])
     if channels % _HIF4_BLOCK_SIZE != 0:
@@ -352,23 +355,103 @@ def _quantize_hif4(
             base_scale.unsqueeze(-1) * multipliers.unsqueeze(0)
         )
         weight_block = None if weight_blocks is None else weight_blocks[start:end]
-        global_error, local_choice = _evaluate_hif4_scale_candidates(
-            abs_block,
-            candidate_scales,
-            local_scale_options,
-            weight_block,
-        )
-        if stage1_local_choices_out is not None:
-            stage1_local_choices_out[start:end] = local_choice[:, 2:]
-        global_choice = global_error.argmin(dim=-1)
-
         row_index = torch.arange(end - start, device=device)
+        if adaptive_linear_guard and weight_block is not None:
+            # Only blocks with a sufficiently balanced normalized weighting
+            # may omit the two low guard scales.  Zero-weight blocks retain
+            # the complete guard because their ratio is non-finite.
+            weight_min = weight_block.amin(dim=(1, 2, 3))
+            weight_max = weight_block.amax(dim=(1, 2, 3))
+            use_short_guard = (weight_min / weight_max) > 0.02
+            full_guard = ~use_short_guard
+            global_choice = torch.empty(
+                end - start,
+                dtype=torch.int64,
+                device=device,
+            )
+            baseline_error = torch.empty(
+                end - start,
+                dtype=torch.float32,
+                device=device,
+            )
+            baseline_local = torch.empty(
+                end - start,
+                8,
+                dtype=torch.int64,
+                device=device,
+            )
+            stage1_local_chunk = None
+            if stage1_local_choices_out is not None:
+                stage1_local_chunk = torch.empty(
+                    (
+                        end - start,
+                        len(_LINEAR_HESSIAN_GLOBAL_SCALE_MULTIPLIERS),
+                        8,
+                    ),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+            if bool(full_guard.any()):
+                full_error, full_local_choice = _evaluate_hif4_scale_candidates(
+                    abs_block[full_guard],
+                    candidate_scales[full_guard],
+                    local_scale_options,
+                    weight_block[full_guard],
+                )
+                full_choice = full_error.argmin(dim=-1)
+                global_choice[full_guard] = full_choice
+                baseline_error[full_guard] = full_error.gather(
+                    1,
+                    full_choice[:, None],
+                ).squeeze(1)
+                baseline_local[full_guard] = full_local_choice.gather(
+                    1,
+                    full_choice[:, None, None].expand(-1, 1, 8),
+                ).squeeze(1)
+                if stage1_local_chunk is not None:
+                    stage1_local_chunk[full_guard] = full_local_choice[:, 2:].to(
+                        dtype=torch.uint8,
+                    )
+            if bool(use_short_guard.any()):
+                short_error, short_local_choice = _evaluate_hif4_scale_candidates(
+                    abs_block[use_short_guard],
+                    candidate_scales[use_short_guard, 2:],
+                    local_scale_options,
+                    weight_block[use_short_guard],
+                )
+                short_choice = short_error.argmin(dim=-1)
+                global_choice[use_short_guard] = short_choice + 2
+                baseline_error[use_short_guard] = short_error.gather(
+                    1,
+                    short_choice[:, None],
+                ).squeeze(1)
+                baseline_local[use_short_guard] = short_local_choice.gather(
+                    1,
+                    short_choice[:, None, None].expand(-1, 1, 8),
+                ).squeeze(1)
+                if stage1_local_chunk is not None:
+                    stage1_local_chunk[use_short_guard] = short_local_choice.to(
+                        dtype=torch.uint8,
+                    )
+            if stage1_local_choices_out is not None:
+                stage1_local_choices_out[start:end] = stage1_local_chunk
+        else:
+            global_error, local_choice = _evaluate_hif4_scale_candidates(
+                abs_block,
+                candidate_scales,
+                local_scale_options,
+                weight_block,
+            )
+            if stage1_local_choices_out is not None:
+                stage1_local_choices_out[start:end] = local_choice[:, 2:]
+            global_choice = global_error.argmin(dim=-1)
+            baseline_error = global_error[row_index, global_choice]
+            baseline_local = local_choice.gather(
+                1,
+                global_choice[:, None, None].expand(-1, 1, 8),
+            ).squeeze(1)
+
         baseline_scale = candidate_scales[row_index, global_choice]
-        baseline_error = global_error[row_index, global_choice]
-        baseline_local = local_choice.gather(
-            1,
-            global_choice[:, None, None].expand(-1, 1, 8),
-        ).squeeze(1)
         chosen_scale = baseline_scale
         chosen_local = baseline_local
 
@@ -377,13 +460,29 @@ def _quantize_hif4(
                 baseline_scale.unsqueeze(-1)
                 * refinement_multipliers.unsqueeze(0)
             )
-            refined_error, refined_local_choice = (
+            refined_outer_error, refined_outer_local_choice = (
                 _evaluate_hif4_scale_candidates(
                     abs_block,
-                    refined_scales,
+                    refined_scales[:, (0, 1, 3, 4)],
                     local_scale_options,
                     weight_block,
                 )
+            )
+            refined_error = torch.cat(
+                (
+                    refined_outer_error[:, :2],
+                    baseline_error[:, None],
+                    refined_outer_error[:, 2:],
+                ),
+                dim=1,
+            )
+            refined_local_choice = torch.cat(
+                (
+                    refined_outer_local_choice[:, :2],
+                    baseline_local[:, None],
+                    refined_outer_local_choice[:, 2:],
+                ),
+                dim=1,
             )
             refined_global_choice = refined_error.argmin(dim=-1)
             best_refined_error = refined_error[
@@ -650,11 +749,10 @@ def _sweep_local_scales(
                 grouped_delta,
                 group_hessians[group].transpose(-1, -2),
             ).reshape(shared_block_count, -1, 8, 8).permute(1, 0, 2, 3)
-            hessian_delta = (
-                grouped_hessian_delta.reshape_as(delta) * delta
+            delta_loss = (
+                delta
+                * (grouped_hessian_delta.reshape_as(delta) - 2.0 * group_he[:, None, :])
             ).sum(-1)
-            error_delta = 2.0 * (delta * group_he[:, None, :]).sum(-1)
-            delta_loss = hessian_delta - error_delta
             combo_index = delta_loss.argmin(-1)
             chosen_delta_loss = delta_loss.gather(
                 1,
@@ -864,7 +962,7 @@ def _quantize_hif4_block_hessian_weight(
         )
         _, refinement_choices = _evaluate_hif4_scale_candidates(
             batch_abs.view(batch_size, 8, 2, 4),
-            refinement_scales,
+            refinement_scales[:, (0, 1, 3, 4)],
             local_scale_options,
             batch_weights,
         )
@@ -879,12 +977,13 @@ def _quantize_hif4_block_hessian_weight(
                     winner_choices,
                 )
             else:
+                refinement_choice = candidate if candidate < 2 else candidate - 1
                 loss, changes, choices = _sweep_local_scales(
                     batch_values,
                     batch_abs,
                     batch_sign,
                     scale,
-                    refinement_choices[:, candidate],
+                    refinement_choices[:, refinement_choice],
                     hessian_reg,
                     group_hessians,
                     block_count,
@@ -1195,6 +1294,7 @@ def hif4_calibration_and_quantize_weight(
         transformed_weight,
         activation_second,
         return_stage1_local_choices=True,
+        adaptive_linear_guard=True,
     )
     weight_params = _quantize_hif4_block_hessian_weight(
         transformed_weight,
