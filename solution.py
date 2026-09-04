@@ -61,6 +61,19 @@ _GLOBAL_SCALE_MULTIPLIERS = (
     4.00,
 )
 
+# Experimental Linear-v5 beta: retain the central stage-one scale range.
+# The full twelve-value tuple remains the v4 guard's frozen search universe.
+_LINEAR_HESSIAN_GLOBAL_SCALE_MULTIPLIERS = (
+    0.50,
+    0.70,
+    0.85,
+    1.00,
+    1.20,
+    1.50,
+    2.00,
+    2.50,
+)
+
 # A second, block-local pass around the first-stage winner.  The baseline
 # candidate (1.0) is always present, and a refined choice is materialized only
 # after a meaningful local weighted-error reduction.
@@ -723,7 +736,7 @@ def _quantize_hif4_block_hessian_weight(
     total_blocks = rows * block_count
 
     multipliers = torch.tensor(
-        _GLOBAL_SCALE_MULTIPLIERS,
+        _LINEAR_HESSIAN_GLOBAL_SCALE_MULTIPLIERS,
         dtype=torch.float32,
         device=values.device,
     )
@@ -764,7 +777,7 @@ def _quantize_hif4_block_hessian_weight(
             block_count,
         )
 
-        # Stage 1: the frozen v4 universe of 12 global scale candidates.
+        # Beta Stage 1: prune extreme scales from the v5 Hessian search.
         base_scale = batch_abs.amax(-1) / 7.0
         candidate_scales = _snap_to_e6m2(
             base_scale.unsqueeze(-1) * multipliers.unsqueeze(0)
@@ -777,7 +790,7 @@ def _quantize_hif4_block_hessian_weight(
         )
 
         best: tuple | None = None
-        for candidate in range(12):
+        for candidate in range(int(candidate_scales.shape[1])):
             scale = candidate_scales[:, candidate]
             loss, changes, choices = _sweep_local_scales(
                 batch_values,
