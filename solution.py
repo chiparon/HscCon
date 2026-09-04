@@ -531,19 +531,29 @@ def _combo_cache(
 def _block_hessian_product(
     error: torch.Tensor,
     hessian: torch.Tensor,
+    shared_block_count: int | None = None,
 ) -> torch.Tensor:
     """Return H e for each block without also reducing its scalar loss."""
 
+    if shared_block_count is not None:
+        if int(error.shape[0]) % shared_block_count != 0:
+            raise ValueError("shared Hessian block layout is not row-aligned")
+        # Group every output row that shares an input-block Hessian.  This
+        # feeds bmm one matrix per input block instead of gathering a 64x64
+        # copy for every output-row/block pair.
+        grouped_error = error.reshape(-1, shared_block_count, 64).transpose(0, 1)
+        return torch.bmm(grouped_error, hessian).transpose(0, 1).reshape_as(error)
     return torch.bmm(error[:, None, :], hessian).squeeze(1)
 
 
 def _block_hessian_loss(
     error: torch.Tensor,
     hessian: torch.Tensor,
+    shared_block_count: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return e^T H e and H e per block for the given error vectors."""
 
-    hessian_error = _block_hessian_product(error, hessian)
+    hessian_error = _block_hessian_product(error, hessian, shared_block_count)
     return (hessian_error * error).sum(-1), hessian_error
 
 
@@ -555,7 +565,7 @@ def _sweep_local_scales(
     init_choices: torch.Tensor,
     hessian: torch.Tensor,
     group_hessians: list[torch.Tensor],
-    hessian_columns: list[torch.Tensor],
+    shared_block_count: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Two rounds of per-group coordinate descent under the block Hessian."""
 
@@ -569,7 +579,7 @@ def _sweep_local_scales(
         choices,
     )
     error = values - reconstructed
-    hessian_error = _block_hessian_product(error, hessian)
+    hessian_error = _block_hessian_product(error, hessian, shared_block_count)
     changes = torch.zeros(row_count, dtype=torch.int64, device=values.device)
     cache = _combo_cache(abs_values, sign_values, global_scale)
 
@@ -582,8 +592,20 @@ def _sweep_local_scales(
             combo_values = cache[group]
 
             delta = combo_values - group_reconstructed[:, None, :]
+            if shared_block_count is None:
+                raise ValueError("Hessian groups require shared block layout")
+            grouped_delta = delta.reshape(
+                -1,
+                shared_block_count,
+                8,
+                8,
+            ).permute(1, 0, 2, 3).reshape(shared_block_count, -1, 8)
+            grouped_hessian_delta = torch.bmm(
+                grouped_delta,
+                group_hessians[group].transpose(-1, -2),
+            ).reshape(shared_block_count, -1, 8, 8).permute(1, 0, 2, 3)
             hessian_delta = (
-                delta @ group_hessians[group].transpose(-1, -2) * delta
+                grouped_hessian_delta.reshape_as(delta) * delta
             ).sum(-1)
             error_delta = 2.0 * (delta * group_he[:, None, :]).sum(-1)
             delta_loss = hessian_delta - error_delta
@@ -611,10 +633,16 @@ def _sweep_local_scales(
                 error[changed, start:start + 8] = (
                     group_error[changed] - chosen_delta[changed]
                 )
-                hessian_error -= torch.bmm(
-                    hessian_columns[group],
-                    chosen_delta[:, :, None],
-                ).squeeze(-1)
+                grouped_delta = chosen_delta.reshape(
+                    -1,
+                    shared_block_count,
+                    8,
+                ).permute(1, 2, 0)
+                grouped_update = torch.bmm(
+                    hessian[:, :, start:start + 8],
+                    grouped_delta,
+                ).permute(2, 0, 1)
+                hessian_error -= grouped_update.reshape_as(hessian_error)
             choices[:, group] = chosen
 
     # Re-materialize from the final choices so the returned loss and choices
@@ -627,7 +655,11 @@ def _sweep_local_scales(
         global_scale,
         choices,
     )
-    loss, _ = _block_hessian_loss(values - reconstructed, hessian)
+    loss, _ = _block_hessian_loss(
+        values - reconstructed,
+        hessian,
+        shared_block_count,
+    )
     return loss, changes, choices
 
 
@@ -702,28 +734,34 @@ def _quantize_hif4_block_hessian_weight(
     )
     _, _, local_scale_options = _local_scale_options(values.device)
 
-    for start in range(0, total_blocks, _HESSIAN_CHUNK_BLOCKS):
-        end = min(start + _HESSIAN_CHUNK_BLOCKS, total_blocks)
+    # Preserve full output rows per chunk so the compact Hessian can be
+    # broadcast/grouped by input block without a per-row 64x64 gather.
+    chunk_blocks = max(
+        block_count,
+        (_HESSIAN_CHUNK_BLOCKS // block_count) * block_count,
+    )
+    for start in range(0, total_blocks, chunk_blocks):
+        end = min(start + chunk_blocks, total_blocks)
         batch_values = block_values[start:end]
         batch_abs = abs_blocks[start:end]
         batch_sign = sign_blocks[start:end]
-        batch_hessian = hessian_reg[block_index[start:end]]
         batch_weights = weight_blocks[block_index[start:end]].reshape(-1, 8, 2, 4)
         batch_size = int(batch_values.shape[0])
 
         group_hessians = [
-            batch_hessian[:, g * 8:(g + 1) * 8, g * 8:(g + 1) * 8].contiguous()
-            for g in range(8)
-        ]
-        hessian_columns = [
-            batch_hessian[:, :, g * 8:(g + 1) * 8].contiguous()
+            hessian_reg[
+                :,
+                g * 8:(g + 1) * 8,
+                g * 8:(g + 1) * 8,
+            ]
             for g in range(8)
         ]
 
         # Guard reference: the exact v4 parameters and their Hessian loss.
         v4_loss, _ = _block_hessian_loss(
             batch_values - v4_reconstructed[start:end],
-            batch_hessian,
+            hessian_reg,
+            block_count,
         )
 
         # Stage 1: the frozen v4 universe of 12 global scale candidates.
@@ -747,9 +785,9 @@ def _quantize_hif4_block_hessian_weight(
                 batch_sign,
                 scale,
                 local_choices[:, candidate],
-                batch_hessian,
+                hessian_reg,
                 group_hessians,
-                hessian_columns,
+                block_count,
             )
             best = _pick_hessian_candidate(best, loss, changes, scale, choices)
 
@@ -782,9 +820,9 @@ def _quantize_hif4_block_hessian_weight(
                     batch_sign,
                     scale,
                     refinement_choices[:, candidate],
-                    batch_hessian,
+                    hessian_reg,
                     group_hessians,
-                    hessian_columns,
+                    block_count,
                 )
             refined_best = _pick_hessian_candidate(
                 refined_best,
